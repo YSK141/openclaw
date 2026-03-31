@@ -98,6 +98,11 @@ import {
   type ProviderInfo,
 } from "./model-buttons.js";
 import { buildInlineKeyboard } from "./send.js";
+import {
+  handleTelegramExternalChatCallback,
+  isTelegramExternalChatEnabled,
+  handleTelegramExternalChatMessage,
+} from "./telegram-external-chat.js";
 
 export const registerTelegramHandlers = ({
   cfg,
@@ -898,6 +903,7 @@ export const registerTelegramHandlers = ({
     storeAllowFrom: string[];
     sendOversizeWarning: boolean;
     oversizeLogMessage: string;
+    preResolvedMedia?: Awaited<ReturnType<typeof resolveMedia>>;
   }) => {
     const {
       ctx,
@@ -908,6 +914,7 @@ export const registerTelegramHandlers = ({
       storeAllowFrom,
       sendOversizeWarning,
       oversizeLogMessage,
+      preResolvedMedia,
     } = params;
 
     // Text fragment handling - Telegram splits long pastes into multiple inbound messages (~4096 chars).
@@ -1008,47 +1015,49 @@ export const registerTelegramHandlers = ({
       return;
     }
 
-    let media: Awaited<ReturnType<typeof resolveMedia>> = null;
-    try {
-      media = await resolveMedia(
-        ctx,
-        mediaMaxBytes,
-        opts.token,
-        telegramTransport,
-        telegramCfg.apiRoot,
-      );
-    } catch (mediaErr) {
-      if (isMediaSizeLimitError(mediaErr)) {
-        if (sendOversizeWarning) {
-          const limitMb = Math.round(mediaMaxBytes / (1024 * 1024));
-          await withTelegramApiErrorLogging({
-            operation: "sendMessage",
-            runtime,
-            fn: () =>
-              bot.api.sendMessage(chatId, `⚠️ File too large. Maximum size is ${limitMb}MB.`, {
-                reply_parameters: {
-                  message_id: msg.message_id,
-                  allow_sending_without_reply: true,
-                },
-              }),
-          }).catch(() => {});
+    let media: Awaited<ReturnType<typeof resolveMedia>> = preResolvedMedia ?? null;
+    if (preResolvedMedia === undefined) {
+      try {
+        media = await resolveMedia(
+          ctx,
+          mediaMaxBytes,
+          opts.token,
+          telegramTransport,
+          telegramCfg.apiRoot,
+        );
+      } catch (mediaErr) {
+        if (isMediaSizeLimitError(mediaErr)) {
+          if (sendOversizeWarning) {
+            const limitMb = Math.round(mediaMaxBytes / (1024 * 1024));
+            await withTelegramApiErrorLogging({
+              operation: "sendMessage",
+              runtime,
+              fn: () =>
+                bot.api.sendMessage(chatId, `⚠️ File too large. Maximum size is ${limitMb}MB.`, {
+                  reply_parameters: {
+                    message_id: msg.message_id,
+                    allow_sending_without_reply: true,
+                  },
+                }),
+            }).catch(() => {});
+          }
+          logger.warn({ chatId, error: String(mediaErr) }, oversizeLogMessage);
+          return;
         }
-        logger.warn({ chatId, error: String(mediaErr) }, oversizeLogMessage);
+        logger.warn({ chatId, error: String(mediaErr) }, "media fetch failed");
+        await withTelegramApiErrorLogging({
+          operation: "sendMessage",
+          runtime,
+          fn: () =>
+            bot.api.sendMessage(chatId, "⚠️ Failed to download media. Please try again.", {
+              reply_parameters: {
+                message_id: msg.message_id,
+                allow_sending_without_reply: true,
+              },
+            }),
+        }).catch(() => {});
         return;
       }
-      logger.warn({ chatId, error: String(mediaErr) }, "media fetch failed");
-      await withTelegramApiErrorLogging({
-        operation: "sendMessage",
-        runtime,
-        fn: () =>
-          bot.api.sendMessage(chatId, "⚠️ Failed to download media. Please try again.", {
-            reply_parameters: {
-              message_id: msg.message_id,
-              allow_sending_without_reply: true,
-            },
-          }),
-      }).catch(() => {});
-      return;
     }
 
     // Skip sticker-only messages where the sticker was skipped (animated/video)
@@ -1068,6 +1077,45 @@ export const registerTelegramHandlers = ({
           },
         ]
       : [];
+    if (allMedia.length > 0) {
+      runtime.log?.(
+        `[telegram][external-chat] inbound media detected chatId=${chatId} messageId=${msg.message_id} mediaCount=${allMedia.length}`,
+      );
+    }
+    const handledExternalChat = await handleTelegramExternalChatMessage({
+      chatId: String(chatId),
+      message: msg,
+      media: allMedia,
+      sendMessage: async (text, options) => {
+        await bot.api.sendMessage(chatId, text, {
+          ...(options?.replyToMessageId
+            ? {
+                reply_parameters: {
+                  message_id: options.replyToMessageId,
+                  allow_sending_without_reply: true,
+                },
+              }
+            : {}),
+          ...(options?.buttons ? { reply_markup: buildInlineKeyboard(options.buttons) } : {}),
+        });
+      },
+      sendPhoto: async (imageUrl, caption, options) => {
+        await bot.api.sendPhoto(chatId, imageUrl, {
+          caption,
+          ...(options?.replyToMessageId
+            ? {
+                reply_parameters: {
+                  message_id: options.replyToMessageId,
+                  allow_sending_without_reply: true,
+                },
+              }
+            : {}),
+        });
+      },
+    });
+    if (handledExternalChat) {
+      return;
+    }
     const senderId = msg.from?.id ? String(msg.from.id) : "";
     const conversationThreadId = resolvedThreadId ?? dmThreadId;
     const conversationKey =
@@ -1258,6 +1306,26 @@ export const registerTelegramHandlers = ({
       const callbackThreadId = resolvedThreadId ?? dmThreadId;
       const callbackConversationId =
         callbackThreadId != null ? `${chatId}:topic:${callbackThreadId}` : String(chatId);
+      const externalChatHandled = await handleTelegramExternalChatCallback({
+        chatId: String(chatId),
+        data,
+        sendMessage: async (text, options) => {
+          await replyToCallbackChat(
+            text,
+            options?.buttons ? { reply_markup: buildInlineKeyboard(options.buttons) } : undefined,
+          );
+        },
+        editMessage: async (text, options) => {
+          await editCallbackMessage(
+            text,
+            options?.buttons ? { reply_markup: buildInlineKeyboard(options.buttons) } : undefined,
+          );
+        },
+        clearButtons: clearCallbackButtons,
+      });
+      if (externalChatHandled) {
+        return;
+      }
       const pluginBindingApproval = parsePluginBindingApprovalCustomId(data);
       if (pluginBindingApproval) {
         const resolved = await resolvePluginConversationBindingApproval({
@@ -1729,7 +1797,62 @@ export const registerTelegramHandlers = ({
         return;
       }
 
+      let preResolvedMedia: Awaited<ReturnType<typeof resolveMedia>> | undefined;
       if (!event.isGroup && (hasInboundMedia(event.msg) || hasReplyTargetMedia(event.msg))) {
+        if (isTelegramExternalChatEnabled()) {
+          try {
+            preResolvedMedia = await resolveMedia(
+              event.ctx,
+              mediaMaxBytes,
+              opts.token,
+              telegramTransport,
+              telegramCfg.apiRoot,
+            );
+          } catch {
+            preResolvedMedia = undefined;
+          }
+          const handledExternalChat = await handleTelegramExternalChatMessage({
+            chatId: String(event.chatId),
+            message: event.msg,
+            media: preResolvedMedia
+              ? [
+                  {
+                    path: preResolvedMedia.path,
+                    contentType: preResolvedMedia.contentType,
+                  },
+                ]
+              : [],
+            sendMessage: async (text, options) => {
+              await bot.api.sendMessage(event.chatId, text, {
+                ...(options?.replyToMessageId
+                  ? {
+                      reply_parameters: {
+                        message_id: options.replyToMessageId,
+                        allow_sending_without_reply: true,
+                      },
+                    }
+                  : {}),
+                ...(options?.buttons ? { reply_markup: buildInlineKeyboard(options.buttons) } : {}),
+              });
+            },
+            sendPhoto: async (imageUrl, caption, options) => {
+              await bot.api.sendPhoto(event.chatId, imageUrl, {
+                caption,
+                ...(options?.replyToMessageId
+                  ? {
+                      reply_parameters: {
+                        message_id: options.replyToMessageId,
+                        allow_sending_without_reply: true,
+                      },
+                    }
+                  : {}),
+              });
+            },
+          });
+          if (handledExternalChat) {
+            return;
+          }
+        }
         const dmAuthorized = await enforceTelegramDmAccess({
           isGroup: event.isGroup,
           dmPolicy,
@@ -1755,6 +1878,7 @@ export const registerTelegramHandlers = ({
         storeAllowFrom,
         sendOversizeWarning: event.sendOversizeWarning,
         oversizeLogMessage: event.oversizeLogMessage,
+        preResolvedMedia,
       });
     } catch (err) {
       runtime.error?.(danger(`${event.errorMessage}: ${String(err)}`));

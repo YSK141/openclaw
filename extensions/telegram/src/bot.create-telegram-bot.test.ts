@@ -321,6 +321,62 @@ describe("createTelegramBot", () => {
     expect(payload.Body).toContain("cmd:option_a");
     expect(answerCallbackQuerySpy).toHaveBeenCalledWith("cbq-1");
   });
+  it("handles external chat callback_query without routing into the reply pipeline", async () => {
+    await withEnvAsync(
+      {
+        SUPABASE_FUNCTION_BASE_URL: "https://example.supabase.co/functions/v1",
+        OPENCLAW_TO_SUPABASE_SHARED_SECRET: "secret",
+      },
+      async () => {
+        const originalFetch = globalThis.fetch;
+        globalThis.fetch = vi.fn(
+          async () =>
+            new Response(
+              JSON.stringify({
+                ok: false,
+                errorCode: "session_expired",
+              }),
+              {
+                status: 410,
+                headers: { "Content-Type": "application/json" },
+              },
+            ),
+        ) as typeof fetch;
+        try {
+          createTelegramBot({ token: "tok" });
+          const callbackHandler = onSpy.mock.calls.find(
+            (call) => call[0] === "callback_query",
+          )?.[1] as (ctx: Record<string, unknown>) => Promise<void>;
+          expect(callbackHandler).toBeDefined();
+
+          await callbackHandler({
+            callbackQuery: {
+              id: "cbq-extchat-1",
+              data: "v1|sel|missingtoken|0",
+              from: { id: 9, first_name: "Ada", username: "ada_bot" },
+              message: {
+                chat: { id: 1234, type: "private" },
+                date: 1736380800,
+                message_id: 10,
+              },
+            },
+            me: { username: "openclaw_bot" },
+            getFile: async () => ({ download: async () => new Uint8Array() }),
+          });
+
+          expect(replySpy).not.toHaveBeenCalled();
+          expect(sendMessageSpy).toHaveBeenCalledWith(
+            1234,
+            "This session expired. Send the photo again to restart.",
+            undefined,
+          );
+          expect(answerCallbackQuerySpy).toHaveBeenCalledWith("cbq-extchat-1");
+        } finally {
+          globalThis.fetch = originalFetch;
+        }
+      },
+    );
+  });
   it("preserves native command source for prefixed callback_query payloads", async () => {
     loadConfig.mockReturnValue({
       commands: { text: false, native: true },
@@ -674,6 +730,88 @@ describe("createTelegramBot", () => {
     } finally {
       fetchSpy.mockRestore();
     }
+  });
+  it("handles external chat photo search before DM pairing when external chat is enabled", async () => {
+    await withIsolatedStateDirAsync(async () => {
+      await withEnvAsync(
+        {
+          SUPABASE_FUNCTION_BASE_URL: "https://example.supabase.co/functions/v1",
+          OPENCLAW_TO_SUPABASE_SHARED_SECRET: "secret",
+        },
+        async () => {
+          loadConfig.mockReturnValue({
+            channels: { telegram: { dmPolicy: "pairing" } },
+          });
+          readChannelAllowFromStore.mockResolvedValue([]);
+          upsertChannelPairingRequest.mockResolvedValue({ code: "PAIRME12", created: true });
+          sendMessageSpy.mockClear();
+          replySpy.mockClear();
+
+          const senderId = Number(`${Date.now()}03`.slice(-9));
+          const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+            const url = String(input);
+            if (url.includes("/file/bottok/photos/p1.jpg")) {
+              return new Response(new Uint8Array([0xff, 0xd8, 0xff, 0x00]), {
+                status: 200,
+                headers: { "content-type": "image/jpeg" },
+              });
+            }
+            if (url.endsWith("/external-chat-reconcile/search")) {
+              return new Response(
+                JSON.stringify({
+                  ok: true,
+                  sessionId: "00000000-0000-0000-0000-000000000123",
+                  candidates: [{ candidateIndex: 0, title: "Vintage Jacket" }],
+                }),
+                { status: 200, headers: { "Content-Type": "application/json" } },
+              );
+            }
+            throw new Error(`unexpected fetch ${url}`);
+          });
+          const getFileSpy = vi.fn(async () => ({ file_path: "photos/p1.jpg" }));
+
+          try {
+            createTelegramBot({ token: "tok" });
+            const handler = getOnHandler("message") as (
+              ctx: Record<string, unknown>,
+            ) => Promise<void>;
+
+            await handler({
+              message: {
+                chat: { id: 1234, type: "private" },
+                message_id: 413,
+                date: 1736380800,
+                photo: [{ file_id: "p1" }],
+                from: { id: senderId, username: "random" },
+              },
+              me: { username: "openclaw_bot" },
+              getFile: getFileSpy,
+            });
+
+            expect(getFileSpy).toHaveBeenCalledWith("p1");
+            expect(fetchSpy).toHaveBeenCalled();
+            expect(sendMessageSpy).toHaveBeenCalledWith(
+              1234,
+              "Photo received. Starting search...",
+              expect.objectContaining({
+                reply_parameters: {
+                  message_id: 413,
+                  allow_sending_without_reply: true,
+                },
+              }),
+            );
+            expect(sendMessageSpy).not.toHaveBeenCalledWith(
+              1234,
+              expect.stringContaining("Pairing code:"),
+              expect.anything(),
+            );
+            expect(replySpy).not.toHaveBeenCalled();
+          } finally {
+            fetchSpy.mockRestore();
+          }
+        },
+      );
+    });
   });
   it("blocks DM media downloads completely when dmPolicy is disabled", async () => {
     loadConfig.mockReturnValue({
