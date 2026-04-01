@@ -1,4 +1,5 @@
 import type { Message, ReactionTypeEmoji } from "@grammyjs/types";
+import { InputFile } from "grammy";
 import { resolveAgentDir, resolveDefaultAgentId } from "openclaw/plugin-sdk/agent-runtime";
 import { resolveDefaultModelForAgent } from "openclaw/plugin-sdk/agent-runtime";
 import { resolveChannelConfigWrites } from "openclaw/plugin-sdk/channel-config-helpers";
@@ -1099,8 +1100,8 @@ export const registerTelegramHandlers = ({
           ...(options?.buttons ? { reply_markup: buildInlineKeyboard(options.buttons) } : {}),
         });
       },
-      sendPhoto: async (imageUrl, caption, options) => {
-        await bot.api.sendPhoto(chatId, imageUrl, {
+      sendPhoto: async (image, caption, options) => {
+        await bot.api.sendPhoto(chatId, new InputFile(image.buffer, image.filename), {
           caption,
           ...(options?.replyToMessageId
             ? {
@@ -1321,7 +1322,9 @@ export const registerTelegramHandlers = ({
             options?.buttons ? { reply_markup: buildInlineKeyboard(options.buttons) } : undefined,
           );
         },
-        clearButtons: clearCallbackButtons,
+        clearButtons: async () => {
+          await clearCallbackButtons();
+        },
       });
       if (externalChatHandled) {
         return;
@@ -1835,8 +1838,8 @@ export const registerTelegramHandlers = ({
                 ...(options?.buttons ? { reply_markup: buildInlineKeyboard(options.buttons) } : {}),
               });
             },
-            sendPhoto: async (imageUrl, caption, options) => {
-              await bot.api.sendPhoto(event.chatId, imageUrl, {
+            sendPhoto: async (image, caption, options) => {
+              await bot.api.sendPhoto(event.chatId, new InputFile(image.buffer, image.filename), {
                 caption,
                 ...(options?.replyToMessageId
                   ? {

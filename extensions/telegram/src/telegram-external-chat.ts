@@ -1,5 +1,6 @@
 import crypto from "node:crypto";
 import fs from "node:fs/promises";
+import path from "node:path";
 import type { Message } from "@grammyjs/types";
 import type { TelegramInlineButtons } from "./button-types.js";
 
@@ -21,6 +22,7 @@ type SearchCandidate = {
   priceLabel?: string;
   channelLabel?: string;
   ebayStateLabel?: string;
+  ebayItemUrl?: string;
 };
 
 type SearchResponse =
@@ -28,6 +30,18 @@ type SearchResponse =
       ok: true;
       sessionId: string;
       candidates: SearchCandidate[];
+      autoSelectCandidateIndex?: number;
+      autoSelectCandidateTitle?: string;
+      autoSelected?: {
+        candidateIndex: number;
+        candidateTitle: string;
+        requiresEndListingChoice: boolean;
+        imageUrl?: string;
+        priceLabel?: string;
+        channelLabel?: string;
+        ebayStateLabel?: string;
+        ebayItemUrl?: string;
+      };
     }
   | { ok: false; errorCode: ExternalChatErrorCode; message?: string };
 
@@ -52,12 +66,20 @@ type LinkResponse =
   | { ok: true; bindingId: string }
   | { ok: false; errorCode: ExternalChatErrorCode; message?: string };
 
-type ChatStage =
-  | "idle"
-  | "awaiting-price"
-  | "awaiting-channel"
-  | "awaiting-endlist"
-  | "awaiting-confirm";
+type DefaultsResponse =
+  | {
+      ok: true;
+      defaultSoldChannel: "store" | "flea" | "other" | null;
+      defaultEndListing: boolean | null;
+      hasDefaultsConfigured: boolean;
+    }
+  | { ok: false; errorCode: ExternalChatErrorCode; message?: string };
+
+type CancelResponse =
+  | { ok: true; cancelled: boolean }
+  | { ok: false; errorCode: ExternalChatErrorCode; message?: string };
+
+type ChatStage = "idle" | "awaiting-price" | "awaiting-channel" | "awaiting-endlist";
 
 type ChatFlowState = {
   token: string;
@@ -68,6 +90,8 @@ type ChatFlowState = {
   soldPrice?: number;
   soldChannel?: "store" | "flea" | "other";
   endListing?: boolean;
+  defaultSoldChannel?: "store" | "flea" | "other" | null;
+  defaultEndListing?: boolean | null;
   requiresEndListingChoice: boolean;
 };
 
@@ -83,7 +107,11 @@ type MessageHandlerParams = {
     },
   ) => Promise<void>;
   sendPhoto?: (
-    imageUrl: string,
+    image: {
+      buffer: Buffer;
+      filename: string;
+      contentType?: string;
+    },
     caption: string,
     options?: {
       replyToMessageId?: number;
@@ -111,11 +139,31 @@ class ExternalChatRequestError extends Error {
   }
 }
 
+class CandidateImageFetchError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "CandidateImageFetchError";
+  }
+}
+
 const LINK_CODE_RE = /^[A-Z0-9]{4,32}$/i;
 const PRICE_RE = /^\d+(?:\.\d{1,2})?$/;
 const CALLBACK_PREFIX = "v1";
 const chatStates = new Map<string, ChatFlowState>();
 const tokenIndex = new Map<string, string>();
+const SETTING_INTENT_PATTERNS = [
+  /default/i,
+  /defaults/i,
+  /from now on/i,
+  /always/i,
+  /set\b/i,
+  /設定/,
+  /デフォルト/,
+  /今後/,
+  /これから/,
+  /毎回/,
+  /通常/,
+];
 
 export function isTelegramExternalChatEnabled(): boolean {
   return (
@@ -206,6 +254,102 @@ function resolveRequestFailureMessage(error: unknown): string {
   return "Something went wrong. Please try again.";
 }
 
+function resolveRuntimeErrorMessage(error: unknown): string {
+  if (error instanceof ExternalChatRequestError) {
+    return resolveRequestFailureMessage(error);
+  }
+  if (error instanceof Error && error.message.trim()) {
+    return error.message;
+  }
+  return "Something went wrong. Please try again.";
+}
+
+function normalizeSettingsText(text: string): string {
+  return text
+    .trim()
+    .toLowerCase()
+    .replace(/[，、。]/g, " ")
+    .replace(/\s+/g, " ");
+}
+
+function hasSettingsIntent(text: string): boolean {
+  return SETTING_INTENT_PATTERNS.some((pattern) => pattern.test(text));
+}
+
+function parseDefaultSoldChannel(text: string): "store" | "flea" | "other" | undefined {
+  if (/(flea market|flea|フリマ|マーケット|popup)/i.test(text)) {
+    return "flea";
+  }
+  if (/(store|shop|店売り|店舗|店)/i.test(text)) {
+    return "store";
+  }
+  if (/(other|その他)/i.test(text)) {
+    return "other";
+  }
+  return undefined;
+}
+
+function parseDefaultEndListing(text: string): boolean | undefined {
+  if (
+    /(keep listed|do not delist|don't remove|leave it|取り下げない|消さない|そのまま残す|出品を残す)/i.test(
+      text,
+    )
+  ) {
+    return false;
+  }
+  if (
+    /(mark as sold|delist|remove|end listing|take down|close listing|デリストする|出品終了する|取り下げる|削除する|mark as soldにする)/i.test(
+      text,
+    )
+  ) {
+    return true;
+  }
+  return undefined;
+}
+
+function parseDefaultsIntent(text: string): {
+  defaultSoldChannel?: "store" | "flea" | "other";
+  defaultEndListing?: boolean;
+} | null {
+  const normalized = normalizeSettingsText(text);
+  if (!hasSettingsIntent(normalized)) {
+    return null;
+  }
+  const defaultSoldChannel = parseDefaultSoldChannel(normalized);
+  const defaultEndListing = parseDefaultEndListing(normalized);
+  if (defaultSoldChannel === undefined && defaultEndListing === undefined) {
+    return null;
+  }
+  return {
+    ...(defaultSoldChannel !== undefined ? { defaultSoldChannel } : {}),
+    ...(defaultEndListing !== undefined ? { defaultEndListing } : {}),
+  };
+}
+
+function formatDefaultsMessage(
+  defaults: Pick<
+    ChatFlowState | Extract<DefaultsResponse, { ok: true }>,
+    "defaultSoldChannel" | "defaultEndListing"
+  >,
+): string {
+  const lines = ["Current defaults:"];
+  lines.push(
+    `Sold channel: ${
+      defaults.defaultSoldChannel ? formatSoldChannelLabel(defaults.defaultSoldChannel) : "Not set"
+    }`,
+  );
+  lines.push(
+    `eBay delist: ${
+      typeof defaults.defaultEndListing === "boolean"
+        ? defaults.defaultEndListing
+          ? "Yes"
+          : "No"
+        : "Not set"
+    }`,
+  );
+  return lines.join("\n");
+}
+
 function buildSelectButtons(token: string, candidates: SearchCandidate[]): TelegramInlineButtons {
   const rows = candidates.map((candidate) => [
     {
@@ -238,22 +382,16 @@ function buildEndListingButtons(token: string): TelegramInlineButtons {
   ];
 }
 
-function buildConfirmButtons(token: string): TelegramInlineButtons {
-  return [
-    [{ text: "Confirm", callback_data: buildCallbackData("ok", token) }],
-    [{ text: "Cancel", callback_data: buildCallbackData("x", token) }],
-  ];
-}
-
 function formatCandidates(candidates: SearchCandidate[]): string {
   const lines = ["I found these possible matches:"];
   for (const candidate of candidates) {
     lines.push(`${candidate.candidateIndex + 1}. ${candidate.title}`);
-    const details = [candidate.priceLabel, candidate.channelLabel, candidate.ebayStateLabel].filter(
-      Boolean,
-    );
+    const details = formatCandidateDetails(candidate);
     if (details.length > 0) {
       lines.push(details.join(" | "));
+    }
+    if (candidate.ebayItemUrl) {
+      lines.push(`eBay: ${candidate.ebayItemUrl}`);
     }
   }
   return lines.join("\n");
@@ -271,7 +409,103 @@ function formatCandidateCaption(candidate: SearchCandidate): string {
   if (details.length > 0) {
     lines.push(details.join(" | "));
   }
+  if (candidate.ebayItemUrl) {
+    lines.push(`eBay: ${candidate.ebayItemUrl}`);
+  }
   return lines.join("\n");
+}
+
+function resolveCandidateImageFilename(imageUrl: string, contentType?: string): string {
+  try {
+    const url = new URL(imageUrl);
+    const name = path.posix.basename(url.pathname);
+    if (name && name !== "/") {
+      return name;
+    }
+  } catch {
+    // Fall back to a synthetic filename below.
+  }
+  if (contentType?.includes("png")) {
+    return "candidate.png";
+  }
+  if (contentType?.includes("webp")) {
+    return "candidate.webp";
+  }
+  return "candidate.jpg";
+}
+
+async function fetchCandidateImage(imageUrl: string): Promise<{
+  buffer: Buffer;
+  filename: string;
+  contentType?: string;
+}> {
+  const response = await fetch(imageUrl);
+  if (!response.ok) {
+    throw new Error(`HTTP ${response.status}`);
+  }
+  const contentType = response.headers.get("content-type")?.trim() || undefined;
+  const buffer = Buffer.from(await response.arrayBuffer());
+  return {
+    buffer,
+    filename: resolveCandidateImageFilename(imageUrl, contentType),
+    contentType,
+  };
+}
+
+async function sendCandidatePreview(params: {
+  chatId: string;
+  candidate: SearchCandidate;
+  replyToMessageId?: number;
+  sendMessage: MessageHandlerParams["sendMessage"];
+  sendPhoto?: MessageHandlerParams["sendPhoto"];
+}): Promise<boolean> {
+  if (!params.candidate.imageUrl) {
+    await params.sendMessage(formatCandidateCaption(params.candidate), {
+      replyToMessageId: params.replyToMessageId,
+    });
+    return false;
+  }
+
+  try {
+    if (!params.sendPhoto) {
+      console.warn(
+        `[telegram][external-chat] candidate photo send unavailable chatId=${params.chatId} candidateIndex=${params.candidate.candidateIndex}`,
+      );
+      throw new Error("sendPhoto unavailable");
+    }
+    let image: {
+      buffer: Buffer;
+      filename: string;
+      contentType?: string;
+    };
+    try {
+      image = await fetchCandidateImage(params.candidate.imageUrl);
+    } catch (error) {
+      console.warn(
+        `[telegram][external-chat] candidate photo fetch failed chatId=${params.chatId} candidateIndex=${params.candidate.candidateIndex} error=${error instanceof Error ? error.message : String(error)}`,
+      );
+      throw new CandidateImageFetchError(error instanceof Error ? error.message : String(error));
+    }
+    await params.sendPhoto(image, formatCandidateCaption(params.candidate), {
+      replyToMessageId: params.replyToMessageId,
+    });
+    return true;
+  } catch (error) {
+    if (
+      params.sendPhoto &&
+      error instanceof Error &&
+      error.message !== "sendPhoto unavailable" &&
+      !(error instanceof CandidateImageFetchError)
+    ) {
+      console.warn(
+        `[telegram][external-chat] candidate photo send failed chatId=${params.chatId} candidateIndex=${params.candidate.candidateIndex} error=${error.message}`,
+      );
+    }
+    await params.sendMessage(formatCandidateCaption(params.candidate), {
+      replyToMessageId: params.replyToMessageId,
+    });
+    return false;
+  }
 }
 
 function clearChatState(chatId: string): void {
@@ -332,25 +566,6 @@ function formatSoldChannelLabel(channel: NonNullable<ChatFlowState["soldChannel"
   }
 }
 
-function buildConfirmSummary(
-  state: Pick<ChatFlowState, "candidateTitle" | "soldPrice" | "soldChannel" | "endListing">,
-): string {
-  const lines = ["Please confirm this update."];
-  if (state.candidateTitle) {
-    lines.push(`Item: ${state.candidateTitle}`);
-  }
-  if (typeof state.soldPrice === "number") {
-    lines.push(`Sold price: ${state.soldPrice}`);
-  }
-  if (state.soldChannel) {
-    lines.push(`Sold channel: ${formatSoldChannelLabel(state.soldChannel)}`);
-  }
-  if (typeof state.endListing === "boolean") {
-    lines.push(`End listing on eBay: ${state.endListing ? "Yes" : "No"}`);
-  }
-  return lines.join("\n");
-}
-
 function maybeParseSoldPrice(text: string): number | null {
   if (!PRICE_RE.test(text.trim())) {
     return null;
@@ -359,9 +574,110 @@ function maybeParseSoldPrice(text: string): number | null {
   return Number.isFinite(value) && value >= 0 ? value : null;
 }
 
+async function fetchDefaults(chatId: string): Promise<Extract<DefaultsResponse, { ok: true }>> {
+  const response = await postJson<DefaultsResponse>("/external-chat-link/defaults/get", {
+    provider: "telegram",
+    chatId,
+  });
+  if (!response.ok) {
+    throw new Error(resolveErrorMessage(response.errorCode, response.message));
+  }
+  return response;
+}
+
+async function updateDefaults(
+  chatId: string,
+  defaults: {
+    defaultSoldChannel?: "store" | "flea" | "other";
+    defaultEndListing?: boolean;
+  },
+): Promise<Extract<DefaultsResponse, { ok: true }>> {
+  const response = await postJson<DefaultsResponse>("/external-chat-link/defaults/update", {
+    provider: "telegram",
+    chatId,
+    ...defaults,
+  });
+  if (!response.ok) {
+    throw new Error(resolveErrorMessage(response.errorCode, response.message));
+  }
+  return response;
+}
+
+async function cancelRemoteSession(chatId: string, sessionId: string): Promise<void> {
+  const response = await postJson<CancelResponse>("/external-chat-reconcile/cancel", {
+    provider: "telegram",
+    chatId,
+    sessionId,
+  });
+  if (!response.ok) {
+    throw new Error(resolveErrorMessage(response.errorCode, response.message));
+  }
+}
+
+async function confirmAndFinish(
+  params: Pick<CallbackHandlerParams, "chatId" | "sendMessage" | "editMessage">,
+  state: ChatFlowState & {
+    soldPrice: number;
+    soldChannel: "store" | "flea" | "other";
+    endListing: boolean;
+  },
+  mode: "message" | "callback",
+): Promise<void> {
+  const response = await postJson<ConfirmResponse>("/external-chat-reconcile/confirm", {
+    provider: "telegram",
+    chatId: params.chatId,
+    sessionId: state.sessionId,
+    soldPrice: state.soldPrice,
+    soldChannel: state.soldChannel,
+    endListing: state.endListing,
+  });
+  clearChatState(params.chatId);
+  const text = !response.ok
+    ? response.message?.trim() || resolveErrorMessage(response.errorCode, response.message)
+    : response.messageCode === "marked_as_sold_end_listing_failed"
+      ? "Marked as sold, but ending the eBay listing failed."
+      : "Marked as sold.";
+  if (mode === "callback") {
+    await params.editMessage(text);
+  } else {
+    await params.sendMessage(text);
+  }
+}
+
 export function resetTelegramExternalChatStateForTests(): void {
   chatStates.clear();
   tokenIndex.clear();
+}
+
+async function startSelectedCandidateFlow(params: {
+  chatId: string;
+  token: string;
+  sessionId: string;
+  candidateTitle: string;
+  requiresEndListingChoice: boolean;
+  sendMessage: (
+    text: string,
+    options?: {
+      buttons?: TelegramInlineButtons;
+      replyToMessageId?: number;
+    },
+  ) => Promise<void>;
+  replyToMessageId?: number;
+}): Promise<void> {
+  const defaults = await fetchDefaults(params.chatId);
+  setChatState({
+    token: params.token,
+    chatId: params.chatId,
+    sessionId: params.sessionId,
+    candidateTitle: params.candidateTitle,
+    requiresEndListingChoice: params.requiresEndListingChoice,
+    defaultSoldChannel: defaults.defaultSoldChannel,
+    defaultEndListing: defaults.defaultEndListing,
+    stage: "awaiting-price",
+  });
+  await params.sendMessage("Enter sold price.", {
+    ...(params.replyToMessageId ? { replyToMessageId: params.replyToMessageId } : {}),
+  });
 }
 
 export async function handleTelegramExternalChatMessage(
@@ -380,12 +696,57 @@ export async function handleTelegramExternalChatMessage(
       return true;
     }
     if (text === "/cancel") {
+      const active = chatStates.get(params.chatId) ?? null;
+      if (active) {
+        await cancelRemoteSession(params.chatId, active.sessionId).catch(() => {});
+      }
       clearChatState(params.chatId);
       await params.sendMessage("Cancelled.", { replyToMessageId: params.message.message_id });
       return true;
     }
 
     const active = chatStates.get(params.chatId) ?? null;
+    if (text === "/defaults") {
+      if (active) {
+        await params.sendMessage("Finish or cancel the current flow before changing defaults.", {
+          replyToMessageId: params.message.message_id,
+        });
+        return true;
+      }
+      try {
+        const defaults = await fetchDefaults(params.chatId);
+        await params.sendMessage(formatDefaultsMessage(defaults), {
+          replyToMessageId: params.message.message_id,
+        });
+      } catch (error) {
+        await params.sendMessage(resolveRuntimeErrorMessage(error), {
+          replyToMessageId: params.message.message_id,
+        });
+      }
+      return true;
+    }
+
+    const defaultsIntent = text ? parseDefaultsIntent(text) : null;
+    if (defaultsIntent) {
+      if (active) {
+        await params.sendMessage("Finish or cancel the current flow before changing defaults.", {
+          replyToMessageId: params.message.message_id,
+        });
+        return true;
+      }
+      try {
+        const defaults = await updateDefaults(params.chatId, defaultsIntent);
+        await params.sendMessage(formatDefaultsMessage(defaults), {
+          replyToMessageId: params.message.message_id,
+        });
+      } catch (error) {
+        await params.sendMessage(resolveRuntimeErrorMessage(error), {
+          replyToMessageId: params.message.message_id,
+        });
+      }
+      return true;
+    }
+
     if (active?.stage === "awaiting-price" && text) {
       const soldPrice = maybeParseSoldPrice(text);
       if (soldPrice == null) {
@@ -394,11 +755,59 @@ export async function handleTelegramExternalChatMessage(
         });
         return true;
       }
-      setChatState({ ...active, soldPrice, stage: "awaiting-channel" });
-      await params.sendMessage("Where was this sold?", {
-        buttons: buildChannelButtons(active.token),
-        replyToMessageId: params.message.message_id,
-      });
+      const nextState: ChatFlowState = { ...active, soldPrice };
+      if (active.defaultSoldChannel) {
+        nextState.soldChannel = active.defaultSoldChannel;
+        if (active.requiresEndListingChoice) {
+          if (typeof active.defaultEndListing === "boolean") {
+            nextState.endListing = active.defaultEndListing;
+            setChatState(nextState);
+            await confirmAndFinish(
+              {
+                chatId: params.chatId,
+                sendMessage: params.sendMessage,
+                editMessage: async (message) => params.sendMessage(message),
+              },
+              nextState as ChatFlowState & {
+                soldPrice: number;
+                soldChannel: "store" | "flea" | "other";
+                endListing: boolean;
+              },
+              "message",
+            );
+          } else {
+            nextState.stage = "awaiting-endlist";
+            setChatState(nextState);
+            await params.sendMessage("End listing on eBay?", {
+              buttons: buildEndListingButtons(active.token),
+              replyToMessageId: params.message.message_id,
+            });
+          }
+        } else {
+          nextState.endListing = false;
+          setChatState(nextState);
+          await confirmAndFinish(
+            {
+              chatId: params.chatId,
+              sendMessage: params.sendMessage,
+              editMessage: async (message) => params.sendMessage(message),
+            },
+            nextState as ChatFlowState & {
+              soldPrice: number;
+              soldChannel: "store" | "flea" | "other";
+              endListing: boolean;
+            },
+            "message",
+          );
+        }
+      } else {
+        nextState.stage = "awaiting-channel";
+        setChatState(nextState);
+        await params.sendMessage("Where was this sold?", {
+          buttons: buildChannelButtons(active.token),
+          replyToMessageId: params.message.message_id,
+        });
+      }
       return true;
     }
 
@@ -460,6 +869,16 @@ export async function handleTelegramExternalChatMessage(
         });
         return true;
       }
+      console.warn(
+        `[telegram][external-chat] search candidates chatId=${params.chatId} count=${response.candidates.length} candidates=${JSON.stringify(
+          response.candidates.map((candidate) => ({
+            candidateIndex: candidate.candidateIndex,
+            title: candidate.title,
+            hasImageUrl: Boolean(candidate.imageUrl),
+            imageUrl: candidate.imageUrl ?? null,
+          })),
+        )}`,
+      );
       if (response.candidates.length === 0) {
         clearChatState(params.chatId);
         await params.sendMessage(
@@ -469,6 +888,45 @@ export async function handleTelegramExternalChatMessage(
         return true;
       }
       const token = createToken();
+      if (response.autoSelected) {
+        const autoSelectedCandidate: SearchCandidate = {
+          candidateIndex: response.autoSelected.candidateIndex,
+          title: response.autoSelected.candidateTitle,
+          ...(response.autoSelected.imageUrl ? { imageUrl: response.autoSelected.imageUrl } : {}),
+          ...(response.autoSelected.priceLabel
+            ? { priceLabel: response.autoSelected.priceLabel }
+            : {}),
+          ...(response.autoSelected.channelLabel
+            ? { channelLabel: response.autoSelected.channelLabel }
+            : {}),
+          ...(response.autoSelected.ebayStateLabel
+            ? { ebayStateLabel: response.autoSelected.ebayStateLabel }
+            : {}),
+          ...(response.autoSelected.ebayItemUrl
+            ? { ebayItemUrl: response.autoSelected.ebayItemUrl }
+            : {}),
+        };
+        await sendCandidatePreview({
+          chatId: params.chatId,
+          candidate: autoSelectedCandidate,
+          replyToMessageId: params.message.message_id,
+          sendMessage: params.sendMessage,
+          sendPhoto: params.sendPhoto,
+        });
+        await params.sendMessage(`Auto-selected match: ${response.autoSelected.candidateTitle}`, {
+          replyToMessageId: params.message.message_id,
+        });
+        await startSelectedCandidateFlow({
+          chatId: params.chatId,
+          token,
+          sessionId: response.sessionId,
+          candidateTitle: response.autoSelected.candidateTitle,
+          requiresEndListingChoice: response.autoSelected.requiresEndListingChoice,
+          sendMessage: params.sendMessage,
+          replyToMessageId: params.message.message_id,
+        });
+        return true;
+      }
       setChatState({
         token,
         chatId: params.chatId,
@@ -478,28 +936,14 @@ export async function handleTelegramExternalChatMessage(
       });
       let sentPhoto = false;
       for (const candidate of response.candidates) {
-        if (!candidate.imageUrl) {
-          await params.sendMessage(formatCandidateCaption(candidate), {
+        sentPhoto =
+          (await sendCandidatePreview({
+            chatId: params.chatId,
+            candidate,
             replyToMessageId: !sentPhoto ? params.message.message_id : undefined,
-          });
-          continue;
-        }
-        try {
-          if (!params.sendPhoto) {
-            throw new Error("sendPhoto unavailable");
-          }
-          await params.sendPhoto(candidate.imageUrl, formatCandidateCaption(candidate), {
-            replyToMessageId: !sentPhoto ? params.message.message_id : undefined,
-          });
-          sentPhoto = true;
-        } catch (error) {
-          console.warn(
-            `[telegram][external-chat] candidate photo send failed chatId=${params.chatId} candidateIndex=${candidate.candidateIndex} error=${error instanceof Error ? error.message : String(error)}`,
-          );
-          await params.sendMessage(formatCandidateCaption(candidate), {
-            replyToMessageId: !sentPhoto ? params.message.message_id : undefined,
-          });
-        }
+            sendMessage: params.sendMessage,
+            sendPhoto: params.sendPhoto,
+          })) || sentPhoto;
       }
       if (!sentPhoto) {
         await params.sendMessage(formatCandidates(response.candidates), {
@@ -543,122 +987,99 @@ export async function handleTelegramExternalChatCallback(
     await params.clearButtons().catch(() => {});
     return true;
   }
-  switch (parsed.action) {
-    case "x":
-      clearChatState(params.chatId);
-      await params.editMessage("Cancelled.");
-      return true;
-    case "sel": {
-      const candidateIndex = Number(parsed.value);
-      const response = await postJson<SelectResponse>("/external-chat-reconcile/select", {
-        provider: "telegram",
-        chatId: params.chatId,
-        sessionId: state.sessionId,
-        candidateIndex,
-      });
-      if (!response.ok) {
-        await params.sendMessage(resolveErrorMessage(response.errorCode, response.message));
+  try {
+    switch (parsed.action) {
+      case "x":
+        await cancelRemoteSession(params.chatId, state.sessionId).catch(() => {});
+        clearChatState(params.chatId);
+        await params.editMessage("Cancelled.");
         return true;
-      }
-      setChatState({
-        ...state,
-        sessionId: response.sessionId,
-        candidateTitle: response.candidateTitle,
-        requiresEndListingChoice: response.requiresEndListingChoice,
-        stage: "awaiting-price",
-      });
-      await params.clearButtons().catch(() => {});
-      await params.sendMessage("Enter sold price.");
-      return true;
-    }
-    case "ch": {
-      if (state.stage !== "awaiting-channel") {
-        await params.sendMessage("Please pick a candidate first.");
-        return true;
-      }
-      const soldChannel = parsed.value;
-      if (soldChannel !== "store" && soldChannel !== "flea" && soldChannel !== "other") {
-        await params.sendMessage("Something went wrong. Please try again.");
-        return true;
-      }
-      const nextState: ChatFlowState = {
-        ...state,
-        soldChannel,
-        stage: state.requiresEndListingChoice ? "awaiting-endlist" : "awaiting-confirm",
-        endListing: state.requiresEndListingChoice ? undefined : false,
-      };
-      setChatState(nextState);
-      if (state.requiresEndListingChoice) {
-        await params.editMessage("End listing on eBay?", {
-          buttons: buildEndListingButtons(state.token),
+      case "sel": {
+        const candidateIndex = Number(parsed.value);
+        const response = await postJson<SelectResponse>("/external-chat-reconcile/select", {
+          provider: "telegram",
+          chatId: params.chatId,
+          sessionId: state.sessionId,
+          candidateIndex,
         });
-      } else {
-        await params.editMessage(
-          buildConfirmSummary({
-            candidateTitle: nextState.candidateTitle,
-            soldPrice: nextState.soldPrice,
-            soldChannel: nextState.soldChannel,
-            endListing: nextState.endListing,
-          }),
-          {
-            buttons: buildConfirmButtons(state.token),
+        if (!response.ok) {
+          await params.sendMessage(resolveErrorMessage(response.errorCode, response.message));
+          return true;
+        }
+        await params.clearButtons().catch(() => {});
+        await startSelectedCandidateFlow({
+          chatId: params.chatId,
+          token: state.token,
+          sessionId: response.sessionId,
+          candidateTitle: response.candidateTitle,
+          requiresEndListingChoice: response.requiresEndListingChoice,
+          sendMessage: params.sendMessage as (
+            text: string,
+            options?: { buttons?: TelegramInlineButtons; replyToMessageId?: number },
+          ) => Promise<void>,
+        });
+        return true;
+      }
+      case "ch": {
+        if (state.stage !== "awaiting-channel") {
+          await params.sendMessage("Please pick a candidate first.");
+          return true;
+        }
+        const soldChannel = parsed.value;
+        if (soldChannel !== "store" && soldChannel !== "flea" && soldChannel !== "other") {
+          await params.sendMessage("Something went wrong. Please try again.");
+          return true;
+        }
+        const nextState: ChatFlowState = {
+          ...state,
+          soldChannel,
+          stage: "idle",
+          endListing: state.requiresEndListingChoice ? undefined : false,
+        };
+        if (state.requiresEndListingChoice) {
+          nextState.stage = "awaiting-endlist";
+          setChatState(nextState);
+          await params.editMessage("End listing on eBay?", {
+            buttons: buildEndListingButtons(state.token),
+          });
+        } else {
+          setChatState(nextState);
+          await confirmAndFinish(
+            params,
+            nextState as ChatFlowState & {
+              soldPrice: number;
+              soldChannel: "store" | "flea" | "other";
+              endListing: boolean;
+            },
+            "callback",
+          );
+        }
+        return true;
+      }
+      case "end": {
+        if (state.stage !== "awaiting-endlist") {
+          await params.sendMessage("Please pick a candidate first.");
+          return true;
+        }
+        const endListing = parsed.value === "yes";
+        const nextState = { ...state, endListing, stage: "idle" as const };
+        setChatState(nextState);
+        await confirmAndFinish(
+          params,
+          nextState as ChatFlowState & {
+            soldPrice: number;
+            soldChannel: "store" | "flea" | "other";
+            endListing: boolean;
           },
+          "callback",
         );
-      }
-      return true;
-    }
-    case "end": {
-      if (state.stage !== "awaiting-endlist") {
-        await params.sendMessage("Please pick a candidate first.");
         return true;
       }
-      const endListing = parsed.value === "yes";
-      const nextState = { ...state, endListing, stage: "awaiting-confirm" as const };
-      setChatState(nextState);
-      await params.editMessage(
-        buildConfirmSummary({
-          candidateTitle: nextState.candidateTitle,
-          soldPrice: nextState.soldPrice,
-          soldChannel: nextState.soldChannel,
-          endListing: nextState.endListing,
-        }),
-        {
-          buttons: buildConfirmButtons(state.token),
-        },
-      );
-      return true;
+      default:
+        return false;
     }
-    case "ok": {
-      if (
-        state.stage !== "awaiting-confirm" ||
-        typeof state.soldPrice !== "number" ||
-        !state.soldChannel ||
-        typeof state.endListing !== "boolean"
-      ) {
-        await params.sendMessage("Please pick a candidate first.");
-        return true;
-      }
-      const response = await postJson<ConfirmResponse>("/external-chat-reconcile/confirm", {
-        provider: "telegram",
-        chatId: params.chatId,
-        sessionId: state.sessionId,
-        soldPrice: state.soldPrice,
-        soldChannel: state.soldChannel,
-        endListing: state.endListing,
-      });
-      clearChatState(params.chatId);
-      if (!response.ok) {
-        await params.editMessage(resolveErrorMessage(response.errorCode, response.message));
-        return true;
-      }
-      await params.editMessage(
-        response.messageCode === "marked_as_sold_end_listing_failed"
-          ? "Marked as sold, but ending the eBay listing failed."
-          : "Marked as sold.",
-      );
-      return true;
-    }
-    default:
-      return false;
+  } catch (error) {
+    await params.sendMessage(resolveRuntimeErrorMessage(error));
+    return true;
   }
 }

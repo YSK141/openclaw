@@ -194,9 +194,22 @@ response shape の正本は InventoryManager 側 canonical contract にある。
 - 各 candidate の利用 field
   - `candidateIndex`
   - `title`
+  - `imageUrl?`
   - `priceLabel?`
   - `channelLabel?`
   - `ebayStateLabel?`
+  - `ebayItemUrl?`
+- `autoSelectCandidateIndex?`
+- `autoSelectCandidateTitle?`
+- `autoSelected?`
+  - `candidateIndex`
+  - `candidateTitle`
+  - `requiresEndListingChoice`
+  - `imageUrl?`
+  - `priceLabel?`
+  - `channelLabel?`
+  - `ebayStateLabel?`
+  - `ebayItemUrl?`
 
 #### select response
 
@@ -222,6 +235,27 @@ response shape の正本は InventoryManager 側 canonical contract にある。
 - `message?`
 
 OpenClaw 側は freeform string を分岐条件に使わず、`errorCode` / `resultCode` / `messageCode` の closed な code を優先する。
+
+## Candidate Preview
+
+- candidate preview は manual selection と auto-select で共通化する
+- 各候補は次を表示できる
+  - title
+  - price label
+  - channel label
+  - eBay state
+  - `ebayItemUrl` がある場合は plain URL
+- `imageUrl` がある場合は photo message + caption として表示する
+- `imageUrl` が無い、または photo 送信に失敗した場合だけ text fallback にする
+
+## Auto-select Rendering
+
+- auto-select 時も選択済み candidate preview を先に表示する
+- auto-select path の表示順は次とする
+  1. candidate preview
+  2. `Auto-selected match: ...`
+  3. `Enter sold price.`
+- auto-select 時は `Choose a match:` と manual select buttons を出さない
 
 ## 署名
 

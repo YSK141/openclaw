@@ -1487,6 +1487,7 @@
                 "group": "Technical reference",
                 "pages": [
                   "pi",
+                  "reference/git-fork-workflow",
                   "reference/wizard",
                   "reference/token-use",
                   "reference/secretref-credential-surface",
