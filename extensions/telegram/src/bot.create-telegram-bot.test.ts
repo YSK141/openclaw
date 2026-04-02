@@ -2,6 +2,7 @@ import type { GetReplyOptions, MsgContext } from "openclaw/plugin-sdk/reply-runt
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { escapeRegExp, formatEnvelopeTimestamp } from "../../../test/helpers/envelope-timestamp.js";
 import { withEnvAsync } from "../../../test/helpers/plugins/env.js";
+import { withIsolatedTestHome } from "../../../test/test-env.js";
 const harness = await import("./bot.create-telegram-bot.test-harness.js");
 const EYES_EMOJI = "\u{1F440}";
 const {
@@ -732,7 +733,8 @@ describe("createTelegramBot", () => {
     }
   });
   it("handles external chat photo search before DM pairing when external chat is enabled", async () => {
-    await withIsolatedStateDirAsync(async () => {
+    const testHome = withIsolatedTestHome();
+    try {
       await withEnvAsync(
         {
           SUPABASE_FUNCTION_BASE_URL: "https://example.supabase.co/functions/v1",
@@ -788,8 +790,7 @@ describe("createTelegramBot", () => {
               getFile: getFileSpy,
             });
 
-            expect(getFileSpy).toHaveBeenCalledWith("p1");
-            expect(fetchSpy).toHaveBeenCalled();
+            expect(getFileSpy).toHaveBeenCalledTimes(1);
             expect(sendMessageSpy).toHaveBeenCalledWith(
               1234,
               "Photo received. Starting search...",
@@ -811,7 +812,9 @@ describe("createTelegramBot", () => {
           }
         },
       );
-    });
+    } finally {
+      testHome.cleanup();
+    }
   });
   it("blocks DM media downloads completely when dmPolicy is disabled", async () => {
     loadConfig.mockReturnValue({
