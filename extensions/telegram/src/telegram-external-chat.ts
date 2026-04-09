@@ -79,7 +79,12 @@ type CancelResponse =
   | { ok: true; cancelled: boolean }
   | { ok: false; errorCode: ExternalChatErrorCode; message?: string };
 
-type ChatStage = "idle" | "awaiting-price" | "awaiting-channel" | "awaiting-endlist";
+type ChatStage =
+  | "idle"
+  | "awaiting-photo"
+  | "awaiting-price"
+  | "awaiting-channel"
+  | "awaiting-endlist";
 
 type ChatFlowState = {
   token: string;
@@ -92,6 +97,8 @@ type ChatFlowState = {
   endListing?: boolean;
   defaultSoldChannel?: "store" | "flea" | "other" | null;
   defaultEndListing?: boolean | null;
+  sessionSoldChannel?: "store" | "flea" | "other";
+  sessionEndListing?: boolean;
   requiresEndListingChoice: boolean;
 };
 
@@ -326,6 +333,38 @@ function parseDefaultsIntent(text: string): {
   };
 }
 
+function parseMarkAsSoldTriggerIntent(text: string): {
+  sessionSoldChannel?: "store" | "flea" | "other";
+  sessionEndListing?: boolean;
+} | null {
+  const normalized = normalizeSettingsText(text)
+    .replace(/[!?.,:;()"'`]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!normalized) {
+    return null;
+  }
+
+  const hasMarkAsSoldIntent =
+    /\bmark\b.*\bas sold\b/i.test(normalized) || /\bmark as sold\b/i.test(normalized);
+  const hasDelistIntent =
+    /\bdelist\b.*\b(?:this|it|item|sold item|listing|ebay|ebay listing)\b/i.test(normalized) ||
+    /\bremove\b.*\bfrom ebay\b/i.test(normalized) ||
+    /\b(?:end|close)\b.*\b(?:the )?(?:ebay )?listing\b/i.test(normalized) ||
+    /\btake\b.*\bdown\b.*\b(?:the )?(?:ebay )?(?:listing|item|this|it)\b/i.test(normalized);
+
+  if (!hasMarkAsSoldIntent && !hasDelistIntent) {
+    return null;
+  }
+
+  const sessionSoldChannel = parseDefaultSoldChannel(normalized);
+  const sessionEndListing = parseDefaultEndListing(normalized);
+  return {
+    ...(sessionSoldChannel !== undefined ? { sessionSoldChannel } : {}),
+    ...(sessionEndListing !== undefined ? { sessionEndListing } : {}),
+  };
+}
+
 function formatDefaultsMessage(
   defaults: Pick<
     ChatFlowState | Extract<DefaultsResponse, { ok: true }>,
@@ -348,6 +387,23 @@ function formatDefaultsMessage(
     }`,
   );
   return lines.join("\n");
+}
+
+function formatSessionOverrideSummary(params: {
+  sessionSoldChannel?: "store" | "flea" | "other";
+  sessionEndListing?: boolean;
+}): string | null {
+  const parts: string[] = [];
+  if (params.sessionSoldChannel) {
+    parts.push(`sold channel = ${formatSoldChannelLabel(params.sessionSoldChannel)}`);
+  }
+  if (typeof params.sessionEndListing === "boolean") {
+    parts.push(`eBay delist = ${params.sessionEndListing ? "Yes" : "No"}`);
+  }
+  if (parts.length === 0) {
+    return null;
+  }
+  return `This session will use: ${parts.join(", ")}.`;
 }
 
 function buildSelectButtons(token: string, candidates: SearchCandidate[]): TelegramInlineButtons {
@@ -655,6 +711,8 @@ async function startSelectedCandidateFlow(params: {
   sessionId: string;
   candidateTitle: string;
   requiresEndListingChoice: boolean;
+  sessionSoldChannel?: "store" | "flea" | "other";
+  sessionEndListing?: boolean;
   sendMessage: (
     text: string,
     options?: {
@@ -671,8 +729,12 @@ async function startSelectedCandidateFlow(params: {
     sessionId: params.sessionId,
     candidateTitle: params.candidateTitle,
     requiresEndListingChoice: params.requiresEndListingChoice,
-    defaultSoldChannel: defaults.defaultSoldChannel,
-    defaultEndListing: defaults.defaultEndListing,
+    defaultSoldChannel: params.sessionSoldChannel ?? defaults.defaultSoldChannel,
+    defaultEndListing: params.sessionEndListing ?? defaults.defaultEndListing,
+    ...(params.sessionSoldChannel ? { sessionSoldChannel: params.sessionSoldChannel } : {}),
+    ...(params.sessionEndListing !== undefined
+      ? { sessionEndListing: params.sessionEndListing }
+      : {}),
     stage: "awaiting-price",
   });
   await params.sendMessage("Enter sold price.", {
@@ -697,7 +759,7 @@ export async function handleTelegramExternalChatMessage(
     }
     if (text === "/cancel") {
       const active = chatStates.get(params.chatId) ?? null;
-      if (active) {
+      if (active?.sessionId) {
         await cancelRemoteSession(params.chatId, active.sessionId).catch(() => {});
       }
       clearChatState(params.chatId);
@@ -726,6 +788,17 @@ export async function handleTelegramExternalChatMessage(
       return true;
     }
 
+    if (active?.stage === "awaiting-photo" && text) {
+      const summary = formatSessionOverrideSummary(active);
+      await params.sendMessage(
+        summary
+          ? `Send a product photo to start mark-as-sold.\n${summary}`
+          : "Send a product photo to start mark-as-sold.",
+        { replyToMessageId: params.message.message_id },
+      );
+      return true;
+    }
+
     const defaultsIntent = text ? parseDefaultsIntent(text) : null;
     if (defaultsIntent) {
       if (active) {
@@ -744,6 +817,32 @@ export async function handleTelegramExternalChatMessage(
           replyToMessageId: params.message.message_id,
         });
       }
+      return true;
+    }
+
+    const soldFlowTriggerIntent = text ? parseMarkAsSoldTriggerIntent(text) : null;
+    if (soldFlowTriggerIntent) {
+      const token = createToken();
+      setChatState({
+        token,
+        chatId: params.chatId,
+        sessionId: "",
+        stage: "awaiting-photo",
+        requiresEndListingChoice: false,
+        ...(soldFlowTriggerIntent.sessionSoldChannel
+          ? { sessionSoldChannel: soldFlowTriggerIntent.sessionSoldChannel }
+          : {}),
+        ...(soldFlowTriggerIntent.sessionEndListing !== undefined
+          ? { sessionEndListing: soldFlowTriggerIntent.sessionEndListing }
+          : {}),
+      });
+      const summary = formatSessionOverrideSummary(soldFlowTriggerIntent);
+      await params.sendMessage(
+        summary
+          ? `Send a product photo to start mark-as-sold.\n${summary}`
+          : "Send a product photo to start mark-as-sold.",
+        { replyToMessageId: params.message.message_id },
+      );
       return true;
     }
 
@@ -922,6 +1021,8 @@ export async function handleTelegramExternalChatMessage(
           sessionId: response.sessionId,
           candidateTitle: response.autoSelected.candidateTitle,
           requiresEndListingChoice: response.autoSelected.requiresEndListingChoice,
+          sessionSoldChannel: active?.sessionSoldChannel,
+          sessionEndListing: active?.sessionEndListing,
           sendMessage: params.sendMessage,
           replyToMessageId: params.message.message_id,
         });
@@ -933,6 +1034,10 @@ export async function handleTelegramExternalChatMessage(
         sessionId: response.sessionId,
         stage: "idle",
         requiresEndListingChoice: false,
+        ...(active?.sessionSoldChannel ? { sessionSoldChannel: active.sessionSoldChannel } : {}),
+        ...(active?.sessionEndListing !== undefined
+          ? { sessionEndListing: active.sessionEndListing }
+          : {}),
       });
       let sentPhoto = false;
       for (const candidate of response.candidates) {
@@ -1013,6 +1118,8 @@ export async function handleTelegramExternalChatCallback(
           sessionId: response.sessionId,
           candidateTitle: response.candidateTitle,
           requiresEndListingChoice: response.requiresEndListingChoice,
+          sessionSoldChannel: state.sessionSoldChannel,
+          sessionEndListing: state.sessionEndListing,
           sendMessage: params.sendMessage as (
             text: string,
             options?: { buttons?: TelegramInlineButtons; replyToMessageId?: number },

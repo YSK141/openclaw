@@ -76,6 +76,18 @@ OpenClaw repo 側で既存 Telegram channel に external chat reconciliation flo
 - 商品画像を送信する
 - 候補 1-3 件が返る
 
+### 3.5. 自然言語起動疎通
+
+- `mark this as sold`
+- `delist this from ebay`
+- `mark this as sold on flea`
+
+のような英語文を送る
+
+- `Send a product photo to start mark-as-sold.` が返る
+- 文に `sold channel` や `eBay delist` の指定が含まれる場合は、そのセッションだけに反映される
+- defaults は更新されない
+
 ### 4. confirm 疎通
 
 - `soldPrice` を入力する
@@ -91,6 +103,8 @@ OpenClaw repo 側で既存 Telegram channel に external chat reconciliation flo
 - webhook を使う場合も新規 webhook 実装は不要で、既存 `extensions/telegram/src/webhook.ts` を使う
 - Telegram file download は既存 Telegram 実装を再利用する
 - OpenClaw 側は bot 会話制御の正本を持ち、InventoryManager 側は business logic の正本を持つ
+- 自然言語起動 parser は deterministic で、`mark as sold` / `delist` / `remove from ebay` / `end listing` 系を英語で解釈する
+- `sell` 単独は起動語に含めない
 
 ## トラブルシュート
 

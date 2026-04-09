@@ -770,6 +770,145 @@ describe("telegram external chat", () => {
     );
   });
 
+  it("starts mark-as-sold flow from natural language and asks for a photo", async () => {
+    process.env.SUPABASE_FUNCTION_BASE_URL = "https://example.supabase.co/functions/v1";
+    process.env.OPENCLAW_TO_SUPABASE_SHARED_SECRET = "secret";
+    globalThis.fetch = vi.fn() as typeof fetch;
+    const sendMessage = vi.fn(async () => undefined);
+
+    const handled = await handleTelegramExternalChatMessage({
+      chatId: "123",
+      message: {
+        message_id: 1,
+        chat: privateChat,
+        date: 1,
+        text: "Please mark this as sold on flea and delist it from eBay",
+      },
+      media: [],
+      sendMessage,
+    });
+
+    expect(handled).toBe(true);
+    expect(sendMessage).toHaveBeenCalledWith(
+      expect.stringContaining("Send a product photo to start mark-as-sold."),
+      expect.objectContaining({ replyToMessageId: 1 }),
+    );
+    expect(sendMessage).toHaveBeenCalledWith(
+      expect.stringContaining("sold channel = Flea, eBay delist = Yes"),
+      expect.objectContaining({ replyToMessageId: 1 }),
+    );
+    expect(globalThis.fetch).not.toHaveBeenCalled();
+  });
+
+  it("does not treat explanatory delist text as external-chat intent", async () => {
+    process.env.SUPABASE_FUNCTION_BASE_URL = "https://example.supabase.co/functions/v1";
+    process.env.OPENCLAW_TO_SUPABASE_SHARED_SECRET = "secret";
+    const sendMessage = vi.fn(async () => undefined);
+
+    const handled = await handleTelegramExternalChatMessage({
+      chatId: "123",
+      message: {
+        message_id: 1,
+        chat: privateChat,
+        date: 1,
+        text: "What does delist mean?",
+      },
+      media: [],
+      sendMessage,
+    });
+
+    expect(handled).toBe(false);
+    expect(sendMessage).not.toHaveBeenCalled();
+  });
+
+  it("applies natural-language session overrides to the current sold flow only", async () => {
+    process.env.SUPABASE_FUNCTION_BASE_URL = "https://example.supabase.co/functions/v1";
+    process.env.OPENCLAW_TO_SUPABASE_SHARED_SECRET = "secret";
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-extchat-"));
+    const imagePath = path.join(tmpDir, "photo.jpg");
+    fs.writeFileSync(imagePath, Buffer.from("fake-image"));
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/external-chat-reconcile/search")) {
+        return new Response(
+          JSON.stringify({
+            ok: true,
+            sessionId: "00000000-0000-0000-0000-000000000123",
+            autoSelectCandidateIndex: 0,
+            autoSelectCandidateTitle: "Vintage Jacket",
+            autoSelected: {
+              candidateIndex: 0,
+              candidateTitle: "Vintage Jacket",
+              requiresEndListingChoice: true,
+            },
+            candidates: [{ candidateIndex: 0, title: "Vintage Jacket" }],
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+      if (url.endsWith("/external-chat-link/defaults/get")) {
+        return new Response(
+          JSON.stringify({
+            ok: true,
+            defaultSoldChannel: "store",
+            defaultEndListing: false,
+            hasDefaultsConfigured: true,
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+      if (url.endsWith("/external-chat-reconcile/confirm")) {
+        expectDefined(init?.body as string | undefined, "expected confirm request body");
+        expect(JSON.parse(String(init?.body))).toEqual(
+          expect.objectContaining({
+            soldPrice: 220,
+            soldChannel: "flea",
+            endListing: true,
+          }),
+        );
+        return new Response(
+          JSON.stringify({
+            ok: true,
+            resultCode: "sold_marked",
+            messageCode: "marked_as_sold",
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+      throw new Error(`unexpected fetch ${url}`);
+    });
+    globalThis.fetch = fetchMock as typeof fetch;
+    const sendMessage = vi.fn(async () => undefined);
+
+    await handleTelegramExternalChatMessage({
+      chatId: "123",
+      message: {
+        message_id: 1,
+        chat: privateChat,
+        date: 1,
+        text: "Mark this as sold on flea and delist this from eBay",
+      },
+      media: [],
+      sendMessage,
+    });
+
+    await handleTelegramExternalChatMessage({
+      chatId: "123",
+      message: { message_id: 2, chat: privateChat, date: 2 },
+      media: [{ path: imagePath, contentType: "image/jpeg" }],
+      sendMessage,
+    });
+
+    await handleTelegramExternalChatMessage({
+      chatId: "123",
+      message: { message_id: 3, chat: privateChat, date: 3, text: "220" },
+      media: [],
+      sendMessage,
+    });
+
+    expect(sendMessage).toHaveBeenLastCalledWith("Marked as sold.");
+  });
+
   it("auto-selects the top candidate and finishes after sold price", async () => {
     process.env.SUPABASE_FUNCTION_BASE_URL = "https://example.supabase.co/functions/v1";
     process.env.OPENCLAW_TO_SUPABASE_SHARED_SECRET = "secret";

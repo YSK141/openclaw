@@ -77,6 +77,27 @@
 12. OpenClaw が `external-chat-reconcile/confirm` を呼ぶ
 13. OpenClaw が結果文面を返す
 
+### 自然言語起動
+
+v1 では、写真アップロード以外に英語の自然言語命令でも external-chat reconciliation flow を開始できる。
+
+- 対象は `mark as sold` / `delist` / `remove from eBay` / `end listing` / `close listing` / `take down listing` 系の intent
+- `sell` 単独は誤検知リスクが高いため起動語に含めない
+- parser は LLM ではなく deterministic な rule-based 実装にする
+- 起動時は即 sold を確定せず、まず `awaiting-photo` 状態に入り `Send a product photo to start mark-as-sold.` を返す
+- その後に画像が来たら既存の `search -> select/auto-select -> sold price -> confirm` flow を使う
+
+自然言語起動文には次の付帯指定を含められる。
+
+- `sold channel`
+- `eBay delist`
+
+これらは saved defaults を更新せず、**そのセッションだけ**に効く override として扱う。
+
+- 例: `mark this as sold on flea`
+- 例: `delist this from ebay`
+- 例: `mark this as sold and keep it listed on ebay`
+
 ## OpenClaw 側アーキテクチャ
 
 ### 統合先
@@ -288,15 +309,25 @@ OpenClaw 側で保持してよい state は短命キャッシュに限定する�
 
 - `callbackToken -> sessionId`
 - `chatId -> callbackToken`
+- `awaiting-photo`
 - `candidateTitle`
 - `soldPrice`
 - `soldChannel`
 - `endListing`
 - `requiresEndListingChoice`
+- session-scoped `soldChannel` override
+- session-scoped `endListing` override
 
 session の正本は InventoryManager 側の永続 session にあり、OpenClaw 側 state は transport 補助でしかない。
 
 v1 では `chatId -> callbackToken` を単一 active flow の参照として使い、同一 chat の新しい flow が始まったら古い token は無効化してよい。
+
+優先順位は以下。
+
+1. active sold-flow input
+2. session-scoped override
+3. saved defaults
+4. 後続の質問フロー
 
 ## UI 文面
 
@@ -304,6 +335,7 @@ v1 では `chatId -> callbackToken` を単一 active flow の参照として使�
 
 - `Send a product photo to find a matching inventory item.`
 - `Send your link code to connect this Telegram account.`
+- `Send a product photo to start mark-as-sold.`
 - `Your Telegram account is now linked.`
 - `I found these possible matches:`
 - `Select 1`
@@ -323,6 +355,11 @@ v1 では `chatId -> callbackToken` を単一 active flow の参照として使�
 - `Marked as sold.`
 - `Marked as sold, but ending the eBay listing failed.`
 - `Something went wrong. Please try again.`
+
+自然言語起動時は、必要なら今回だけの override を短く確認してよい。
+
+- `This session will use: sold channel = Flea`
+- `This session will use: eBay delist = Yes`
 
 ## エラー方針
 
